@@ -123,6 +123,54 @@ The full backend contract is documented in the Forge README's
 - `sim/tb_rand.v` — testbench for the random tester
 - `sim/synth_test.v` — synthesis wrapper instantiating the core alone
 
+## Interrupts, privilege, MMU (Phases 2 and 3)
+
+On top of the pipelined core: M-mode interrupts (CLINT timer
+ticking every cycle, external line, 16-byte UART RX FIFO),
+vectored `mtvec`, privilege modes M/S/U with trap delegation
+and `sret`, and an Sv32 MMU with a multi-cycle page-table
+walker (no TLB) on a unified-memory SOC top
+(`src/big32_soc.v`). Full design, CSR/bit lists, walk timing,
+memory map, deviations from the privileged specification, and
+test results are in
+[`PRIVILEGE_MMU.md`](PRIVILEGE_MMU.md). Re-run with
+`./run_soc.sh` (11/11 SOC checks, then the Phase 1 pipe suite
+as regression). Still simulation only: no Linux/xv6 boot, no
+RISCOF, no formal verification, no silicon.
+
+## OS boot (Phase 4)
+
+M-mode firmware delegates traps to an S-mode kernel, which
+enables Sv32 translation, counts CLINT timer ticks, drops to
+U-mode, serves print/exit syscalls, demand-maps a faulting
+page, and shuts down cleanly through the firmware — with the
+full UART boot transcript checked byte-for-byte. No xv6 or
+Linux boots here (xv6-riscv is RV64/Sv39; see the assessment
+in the doc). Full design, delegation table, memory map,
+syscall ABI, transcript, xv6 blockers, and the Linux roadmap
+are in [`OS_BOOT.md`](OS_BOOT.md). Re-run with `./run_os.sh`
+(OS boot check, then `./run_soc.sh` as regression). This phase
+also fixed a latent core bug: S interrupt delivery now
+requires the source to actually be pending (previously, merely
+enabling an S interrupt took a phantom interrupt forever).
+
+## Pipelined core (Phase 1)
+
+The v7 single-cycle core now has a pipelined sibling that keeps
+its exact semantics: a 5-stage IF/ID/EX/MEM/WB core in
+`src/big32_core_pipe.v` with full forwarding, load-use and CSR
+stalls, branch/jump flushes (JAL in ID, branches/JALR/traps/
+mret in EX), AMO in MEM, and an iterative 32-cycle divider
+(edge-case divisions still single-cycle). MUL stays
+combinational. Full design, stall/flush rules, commit rules,
+cycle-count table, and test results are in
+[`PIPELINE.md`](PIPELINE.md). Re-run it with `./run_pipe.sh`
+(16/16 directed checks with full register/UART/memory
+comparison, 50/50 hazard-heavy random tests — plus a second
+50/50 batch on fresh seeds). The v7 files are untouched and
+v7 still passes its full suite. Still M-mode only, still
+simulation only: no S/U modes, MMU, interrupts, or Linux yet.
+
 ## Production hardening (v4)
 
 This is what "production ready" work actually looks like for a core
@@ -313,38 +361,54 @@ v4 adds 50/50 random differential tests passing (see above). v5
 keeps all 15 directed programs passing (edge_cases a0 = 0) and
 re-runs the random suite on the new core.
 
-## Why this is not Linux yet — honest roadmap
+## Why this is not Linux yet — honest roadmap (updated after Phases 1–4)
 
-Linux on RISC-V needs, at minimum, all of the following, and big32 v3
-has the first items but not the rest:
+Linux on RISC-V needs, at minimum, all of the following. Status
+as of the Linux-capable phases (see PIPELINE.md, PRIVILEGE_MMU.md,
+OS_BOOT.md for the evidence):
 
-1. **M extension** — DONE in v2.
+1. **M extension** — DONE in v2 (divider now multi-cycle in the
+   pipelined core, Phase 1).
 2. **A extension** — DONE in v3 (word atomics, single core).
-3. **Privileged architecture** — PARTLY done in v3: M-mode CSRs,
-   traps, and mret exist, but there is no S-mode or U-mode yet, no
-   interrupt handling, and no privilege separation between kernel
-   and user programs.
-4. **MMU (Sv32)** — NOT done. This needs virtual memory with page
-   tables, and it forces a move from Harvard memories to a unified
-   memory system, plus a multi-cycle page-table walker (a single
-   cycle cannot do a page walk).
-5. **Peripherals** — PARTLY done: a UART TX exists, but there is no
-   UART RX input, no timer (CLINT), no interrupt controller (PLIC),
-   and no block device (virtio-blk or similar) for a root filesystem.
-6. **Much more memory** — Linux wants megabytes, not 64KB, and a
-   bootloader (like OpenSBI) to start it.
+3. **Privileged architecture** — DONE in Phases 2–3: M/S/U modes,
+   trap delegation, sret/mret, interrupts (CLINT timer, external
+   line, UART RX interrupt), and a working S-mode kernel with a
+   U-mode user program (Phase 4).
+4. **MMU (Sv32)** — DONE in Phase 3: two-level page-table walker
+   (multi-cycle, no TLB), unified-memory SOC top, page faults
+   with correct causes and tval.
+5. **Peripherals** — PARTLY done: UART TX + RX, CLINT timer, and
+   a simple external-interrupt line exist, but there is NO PLIC,
+   NO virtio block device (so no root filesystem path), and the
+   UART is NOT 16550-compatible.
+6. **Much more memory + bootloader** — PARTLY done: SOC RAM is
+   parameterisable (1 MiB default, 8 MiB by instantiation) but
+   Linux wants a Linux-compatible address layout, an SBI firmware
+   (not just the Phase 4 M-firmware), and a device tree.
 
-After that come the long tail: a device tree, a RISC-V toolchain and
-a kernel build for this exact machine, a root filesystem, and a lot
-of debugging. That is a real project, not a weekend upgrade — but
-every one of those steps builds on this core, and this core now has
-a working kernel of its own, which is where you have to start.
+What is still missing, in order: SBI firmware + device tree,
+PLIC, 64-bit timer handling over the 32-bit CLINT, virtio
+block/network or a ramdisk root, a 16550-compatible UART,
+megabytes of RAM at a Linux-compatible address, a bootloader
+stage, and core gaps (a real TLB model, A/D bits, misaligned
+semantics — big32 continues into the next physical page, a
+third behaviour Linux does not expect — FPU/PMP), plus a
+RISC-V toolchain and kernel build for this exact machine and
+a much faster simulator/FPGA for usable speed. xv6-riscv is
+NOT an intermediate step here: it is RV64/Sv39 and cannot run
+on this RV32/Sv32 core (see OS_BOOT.md). RV32 Linux, by
+contrast, is architecturally possible — it is blocked by the
+missing platform pieces above, not by word size.
 
 ## Next steps (in order)
 
 1. ~~M extension~~ — done in v2. ~~A extension~~ — done in v3.
    ~~M-mode CSRs/traps + UART + tiny kernel~~ — done in v3.
-2. S-mode + U-mode, interrupt handling, UART RX.
-3. Sv32 MMU + unified memory (multi-cycle core or a page-walk unit).
-4. Timer + interrupt controller + block device, then a bootloader.
-5. Only then: try to boot Linux, and expect it to take a while.
+   ~~5-stage pipeline~~ — done in Phase 1. ~~Interrupts,
+   S/U modes, Sv32 MMU, unified memory~~ — done in Phases 2–3.
+   ~~M-firmware + S-kernel + U user program~~ — done in Phase 4.
+2. SBI firmware + device tree + PLIC.
+3. Virtio block (or ramdisk root) + 16550 UART + 64-bit timer
+   handling + Linux-compatible memory layout.
+4. Only then: try to boot RV32 Linux, and expect it to take a
+   while.
