@@ -51,6 +51,7 @@ module big32_pipe #(
         .d_we_o(d_we_w),
         .irq_timer(1'b0),
         .irq_ext(1'b0),
+        .irq_soft(1'b0),
         .uart_rx_ready(1'b0),
         .uart_rx_data(8'b0),
         .uart_rx_pop()

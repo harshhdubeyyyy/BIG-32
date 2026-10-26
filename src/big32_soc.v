@@ -90,6 +90,7 @@ module big32_soc #(
         .d_we_o(d_we_w),
         .irq_timer(mtime_r >= mtimecmp_r),
         .irq_ext(ext_irq | rx_ready),
+        .irq_soft(1'b0),
         .uart_rx_ready(rx_ready),
         .uart_rx_data(rx_head_byte),
         .uart_rx_pop(rx_pop_w)

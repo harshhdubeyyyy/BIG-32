@@ -41,7 +41,10 @@ TESTS = {
                   "args": []},
     "mmu_perm": {"a0": 48879, "ram": {1: 77, 2: 2, 5: 1}, "args": []},
     "int_vectored": {"a0": 2, "ram": {0: 2}, "args": []},
-    "mmu_cross": {"a0": 1144201745, "ram": {1: 1144201745}, "args": []},
+    # Phase 5: the misaligned cross-page lw now TRAPS (cause 4,
+    # tval 0x40000FFE) instead of continuing into the next
+    # physical page (the Phase 3 expectation, 0x44332211).
+    "mmu_cross": {"a0": 4, "ram": {1: 4, 2: 0x40000FFE}, "args": []},
 }
 
 

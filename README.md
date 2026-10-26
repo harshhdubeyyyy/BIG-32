@@ -154,6 +154,33 @@ also fixed a latent core bug: S interrupt delivery now
 requires the source to actually be pending (previously, merely
 enabling an S interrupt took a phantom interrupt forever).
 
+## Linux platform (Phase 5)
+
+New SOC top `src/big32_soc2.v` (the Phase 2–4 top is
+untouched): SBI firmware (Base, TIME, sPI, RFNC, SRST,
+legacy putchar) in `os_programs/sbi_firmware.s`, a device
+tree in `os_programs/big32.dts` (rv32ima, Sv32, PLIC,
+16550 UART, CLINT, virtio-mmio), a real PLIC
+(claim/complete, priorities, enables, lowest-ID tie-break),
+a 16550-compatible UART at 0x10010000, a 64-bit CLINT
+timer, a virtio-mmio block device (queue 0, block only),
+and a bootloader that loads a kernel image from virtio
+into RAM and drops to S-mode. Core gaps closed for Linux:
+a real 16-entry TLB (sfence.vma flushes), A/D bit updates
+on page-table walks (including D-miss re-walk), software
+interrupts (SBI IPI register at 0x10002000), TIME/CYCLE/
+INSTRET counters (the kernel clocksource reads rdtime),
+and misaligned accesses now trap (causes 4/6) instead of
+silently continuing into the next physical page. Tests:
+`./run_soc2.sh` (soc2 + coregaps + sbi + dtb + boot +
+the full Phase 1–4 regression). **Linux 6.6.52 boots
+and prints on big32 in simulation** (SBI probed, DTB
+parsed, earlycon on the 16550, memory/SLUB/IRQ init
+reached — see the full log in
+[`LINUX_BOOT.md`](LINUX_BOOT.md)); userspace is NOT
+reached yet (no root filesystem is provided), and the
+exact remaining blockers are listed there.
+
 ## Pipelined core (Phase 1)
 
 The v7 single-cycle core now has a pipelined sibling that keeps
@@ -361,7 +388,7 @@ v4 adds 50/50 random differential tests passing (see above). v5
 keeps all 15 directed programs passing (edge_cases a0 = 0) and
 re-runs the random suite on the new core.
 
-## Why this is not Linux yet — honest roadmap (updated after Phases 1–4)
+## What remains before a usable Linux system — honest roadmap (updated after Phase 5)
 
 Linux on RISC-V needs, at minimum, all of the following. Status
 as of the Linux-capable phases (see PIPELINE.md, PRIVILEGE_MMU.md,
@@ -377,28 +404,38 @@ OS_BOOT.md for the evidence):
 4. **MMU (Sv32)** — DONE in Phase 3: two-level page-table walker
    (multi-cycle, no TLB), unified-memory SOC top, page faults
    with correct causes and tval.
-5. **Peripherals** — PARTLY done: UART TX + RX, CLINT timer, and
-   a simple external-interrupt line exist, but there is NO PLIC,
-   NO virtio block device (so no root filesystem path), and the
-   UART is NOT 16550-compatible.
-6. **Much more memory + bootloader** — PARTLY done: SOC RAM is
-   parameterisable (1 MiB default, 8 MiB by instantiation) but
-   Linux wants a Linux-compatible address layout, an SBI firmware
-   (not just the Phase 4 M-firmware), and a device tree.
+5. **Peripherals** — DONE in Phase 5: a real PLIC, a
+   virtio-mmio block device (so a root filesystem path
+   exists), a 16550-compatible UART, and a 64-bit CLINT
+   timer. Still no network device and no FPU/PMP.
+6. **Much more memory + bootloader** — DONE for the
+   attempt: SOC2 RAM is parameterisable (1 MiB default,
+   64 MiB for the kernel attempt via the testbench's
+   `-Ptb_soc2.TB_MEM_BYTES`), at the Linux-compatible
+   address 0x80000000, with an SBI firmware and a device
+   tree. The bootloader loads only 2 sectors (1024
+   bytes) from virtio — a real kernel needs thousands
+   of sectors, so the boot attempt loads the Image
+   directly through the testbench (+KIMGBIN, binary)
+   as a documented test-harness shortcut. The kernel
+   Image builds (rv32, no C/FPU/SMP, trimmed) and
+   boots to early printk on big32 (see LINUX_BOOT.md
+   for the log, including the 4MB-alignment fix and
+   the PLIC/context DTB fix found from the boot log).
 
-What is still missing, in order: SBI firmware + device tree,
-PLIC, 64-bit timer handling over the 32-bit CLINT, virtio
-block/network or a ramdisk root, a 16550-compatible UART,
-megabytes of RAM at a Linux-compatible address, a bootloader
-stage, and core gaps (a real TLB model, A/D bits, misaligned
-semantics — big32 continues into the next physical page, a
-third behaviour Linux does not expect — FPU/PMP), plus a
-RISC-V toolchain and kernel build for this exact machine and
-a much faster simulator/FPGA for usable speed. xv6-riscv is
-NOT an intermediate step here: it is RV64/Sv39 and cannot run
-on this RV32/Sv32 core (see OS_BOOT.md). RV32 Linux, by
-contrast, is architecturally possible — it is blocked by the
-missing platform pieces above, not by word size.
+What is still missing, in order: a root filesystem
+with an init (without it the kernel stops at the "no
+working init" panic), a faster simulator or FPGA (Icarus
+at ~0.15 ms/cycle cannot boot Linux end-to-end in a
+session), a bootloader sector loop for multi-megabyte
+images (so the testbench shortcut is no longer needed),
+a boot with the fixed PLIC/context DTB (source fixed,
+boot untested), and FPU/PMP/RISCOF/formal claims —
+none made here. xv6-riscv is NOT an intermediate step
+here: it is RV64/Sv39 and cannot run on this RV32/Sv32
+core (see OS_BOOT.md). RV32 Linux, by contrast, is
+architecturally possible — it is blocked by the missing
+pieces above, not by word size.
 
 ## Next steps (in order)
 
@@ -407,8 +444,13 @@ missing platform pieces above, not by word size.
    ~~5-stage pipeline~~ — done in Phase 1. ~~Interrupts,
    S/U modes, Sv32 MMU, unified memory~~ — done in Phases 2–3.
    ~~M-firmware + S-kernel + U user program~~ — done in Phase 4.
-2. SBI firmware + device tree + PLIC.
-3. Virtio block (or ramdisk root) + 16550 UART + 64-bit timer
-   handling + Linux-compatible memory layout.
-4. Only then: try to boot RV32 Linux, and expect it to take a
-   while.
+   ~~SBI firmware + device tree + PLIC + 16550 UART +
+   64-bit timer + virtio block + bootloader + TLB/A-D/
+   misaligned gaps~~ — done in Phase 5.
+2. ~~Build an RV32 Linux kernel and boot it in
+   simulation~~ — done in Phase 5 (boots and prints;
+   see LINUX_BOOT.md for the log and the exact state).
+3. Next: root filesystem with an init, a boot with the
+   fixed PLIC/context DTB, a bootloader sector loop
+   for multi-megabyte images, and faster
+   simulation/FPGA — then the remaining gaps.

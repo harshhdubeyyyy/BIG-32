@@ -101,14 +101,21 @@ module big32_core_pipe (
     // Phase 2 interrupt inputs (see PRIVILEGE_MMU.md). The SOC top
     // drives irq_timer from the CLINT and irq_ext from
     // ext_irq | uart_rx_ready; the pipe top ties them to 0.
+    // Phase 5: irq_soft is the software interrupt line (driven
+    // by the soc2 SBI IPI register; old tops tie it to 0).
     input  wire        irq_timer,
     input  wire        irq_ext,
+    input  wire        irq_soft,
     // UART RX: ready + head byte from the SOC FIFO (pipe top: 0).
     input  wire        uart_rx_ready,
     input  wire [7:0]  uart_rx_data,
     // Pulsed (combinational) in the MEM cycle of a load from
     // 0x10000004 with a byte available; the SOC pops its FIFO on it.
-    output wire        uart_rx_pop
+    output wire        uart_rx_pop,
+    // Phase 5: MEM-stage load flag, for SOC tops whose register
+    // reads have side effects (16550 RBR pop, PLIC claim).
+    // Old tops leave this unconnected; that is legal Verilog.
+    output wire        mem_load_o
 );
     reg [31:0] pc;
     reg [31:0] regs [0:31];
@@ -138,6 +145,38 @@ module big32_core_pipe (
     // older instructions still commit first, in order.
     reg        fetch_fault_pending;
     reg [31:0] fetch_fault_pc;
+    // Phase 5 TLB: 16 entries, fully associative, round-robin
+    // replacement. An entry maps one 4KB page (VPN -> PPN) or
+    // one 4MB superpage (VPN[31:22] -> PPN[29:20], offset
+    // [21:0]). ASID is ignored (entries are effectively
+    // global); sfence.vma and satp writes flush all entries.
+    // PTE flag bits stored: R=1, W=2, X=3, U=4 (PTE bits).
+    reg        tlb_valid [0:15];
+    reg [19:0] tlb_vpn [0:15];
+    reg [19:0] tlb_ppn [0:15];
+    reg        tlb_r [0:15], tlb_w [0:15], tlb_x [0:15];
+    reg        tlb_u [0:15], tlb_super [0:15];
+    // D bit as known in memory at insert time. A store/AMO
+    // hitting an entry with D=0 must re-walk (state 4 sets D)
+    // instead of silently storing through a stale entry.
+    reg        tlb_d [0:15];
+    // Free-running cycle counter for the TIME/CYCLE/INSTRET
+    // CSRs (see the CSR read block). Advances 1/cycle.
+    reg [63:0] core_cycles;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            core_cycles <= 64'b0;
+        else
+            core_cycles <= core_cycles + 64'd1;
+    end
+    reg [3:0]  tlb_rr;
+    // Phase 5 A/D writeback state for the walker (state 4):
+    // the accepted PTE, its address, and the data to write
+    // (PTE with A set, and D set for stores/AMOs).
+    reg [31:0] ptw_write_addr, ptw_write_data, ptw_accept_pte;
+    reg [31:0] ptw_accept_pa, ptw_accept_va;
+    reg        ptw_accept_super, ptw_accept_is_fetch;
+    reg        ptw_accept_is_store;
     reg        reservation_valid;
     reg [31:0] reservation_addr;
 
@@ -202,8 +241,43 @@ module big32_core_pipe (
     // the PTW stall), so the value there is harmless.
     wire fetch_trans_enabled = (csr_satp[31] == 1'b1) &&
                                (priv != 2'd3);
-    assign if_addr_o = (fetch_trans_enabled && fetch_pa_valid &&
-                        (fetch_pa_pc == pc)) ? fetch_pa : pc;
+    // Phase 5 fetch TLB lookup (pc only, so it can live here;
+    // the data lookup lives with the EX wires below).
+    reg tlb_fetch_hit, tlb_fetch_perm_ok;
+    reg [31:0] tlb_fetch_pa;
+    integer tf;
+    always @* begin
+        tlb_fetch_hit = 1'b0;
+        tlb_fetch_perm_ok = 1'b0;
+        tlb_fetch_pa = 32'b0;
+        for (tf = 0; tf < 16; tf = tf + 1) begin
+            if (tlb_valid[tf]) begin
+                if (tlb_super[tf]) begin
+                    if (tlb_vpn[tf][19:10] == pc[31:22]) begin
+                        tlb_fetch_hit = 1'b1;
+                        tlb_fetch_pa = {tlb_ppn[tf][19:10], pc[21:0]};
+                        tlb_fetch_perm_ok = tlb_x[tf] &&
+                            !((priv == 2'd1) && tlb_u[tf]) &&
+                            !((priv == 2'd0) && !tlb_u[tf]);
+                    end
+                end else if (tlb_vpn[tf] == pc[31:12]) begin
+                    tlb_fetch_hit = 1'b1;
+                    tlb_fetch_pa = {tlb_ppn[tf], pc[11:0]};
+                    tlb_fetch_perm_ok = tlb_x[tf] &&
+                        !((priv == 2'd1) && tlb_u[tf]) &&
+                        !((priv == 2'd0) && !tlb_u[tf]);
+                end
+            end
+        end
+    end
+    wire tlb_fetch_perm_fault = fetch_trans_enabled &&
+        tlb_fetch_hit && !tlb_fetch_perm_ok &&
+        !(fetch_pa_valid && (fetch_pa_pc == pc));
+    assign if_addr_o = (fetch_trans_enabled &&
+                        fetch_pa_valid &&
+                        (fetch_pa_pc == pc)) ? fetch_pa :
+                       (fetch_trans_enabled && tlb_fetch_hit &&
+                        tlb_fetch_perm_ok) ? tlb_fetch_pa : pc;
 
     // Phase 3: page-table walk addresses. Level-1 PTE address =
     // root base + VPN1*4; level-0 PTE address = level-1 PTE's
@@ -238,7 +312,8 @@ module big32_core_pipe (
     // the data port carries the PTE address (the MEM stage holds
     // a bubble then, so nothing else needs the port). During
     // DRAIN the data port is untouched (normal MEM access).
-    assign d_addr_o = ((ptw_state == 3'd2) || (ptw_state == 3'd3)) ?
+    assign d_addr_o = (ptw_state == 3'd4) ? ptw_write_addr :
+                      ((ptw_state == 3'd2) || (ptw_state == 3'd3)) ?
                       ptw_addr : mem_addr;
     wire [7:0]  mb0 = d_rdata_i[7:0];
     wire [7:0]  mb1 = d_rdata_i[15:8];
@@ -335,16 +410,21 @@ module big32_core_pipe (
     end
     // Phase 3: never write during a walk's PTE-read cycles (the
     // MEM stage is a bubble then, so d_we_comb is already 0;
-    // this is belt-and-braces).
-    assign d_we_o = d_we_comb && !((ptw_state == 3'd2) ||
+    // this is belt-and-braces). Phase 5: during the A/D
+    // writeback cycle (state 4) the data port writes the
+    // updated PTE word instead.
+    assign d_we_o = (ptw_state == 3'd4) ? 1'b1 :
+                    d_we_comb && !((ptw_state == 3'd2) ||
                                    (ptw_state == 3'd3));
-    assign d_wdata_o = d_wdata_comb;
-    assign d_wmask_o = d_wmask_comb;
+    assign d_wdata_o = (ptw_state == 3'd4) ? ptw_write_data :
+                       d_wdata_comb;
+    assign d_wmask_o = (ptw_state == 3'd4) ? 4'b1111 : d_wmask_comb;
     // Phase 2: pop the SOC RX FIFO on a MEM-stage load from the RX
     // data register while a byte is available. Stores/AMOs to the
     // RX address do not pop (ex_mem_is_load distinguishes them).
     assign uart_rx_pop = ex_mem_is_load &&
                          (mem_addr == 32'h10000004) && uart_rx_ready;
+    assign mem_load_o = ex_mem_is_load;
 
     // ================= EX stage: forwarding ==========================
     wire [31:0] ex_rs1_raw = regs[id_ex_rs1];
@@ -373,12 +453,12 @@ module big32_core_pipe (
 
     // ================= EX stage: CSR read ============================
     // Phase 2 mip: bit 11 = external (SOC: ext_irq | uart_rx_ready),
-    // bit 7 = timer (SOC: mtime >= mtimecmp). All other mip bits,
-    // including MSIP (3), read 0. mie implements bits 11, 7, 3
-    // (MSIE is stored but never pending: there is no software
-    // interrupt source). mstatus is stored already masked to
-    // MPP (12:11), MPIE (7), MIE (3); all other bits read 0.
-    wire [31:0] mip_val = {20'b0, irq_ext, 3'b0, irq_timer, 7'b0};
+    // bit 7 = timer (SOC: mtime >= mtimecmp). Phase 5: bit 3 =
+    // software (soc2 SBI IPI register). mie implements bits
+    // 11, 7, 3. mstatus is stored already masked to MPP (12:11),
+    // MPIE (7), MIE (3); all other bits read 0.
+    wire [31:0] mip_val = {20'b0, irq_ext, 3'b0, irq_timer, 3'b0,
+                           irq_soft, 3'b0};
     reg [31:0] ex_csr_old;
     always @* begin
         case (id_ex_csr_addr)
@@ -400,6 +480,19 @@ module big32_core_pipe (
             12'h342: ex_csr_old = csr_mcause;
             12'h343: ex_csr_old = csr_mtval;
             12'h344: ex_csr_old = mip_val;
+            // Phase 5 counters: TIME/CYCLE share one free-running
+            // 1/cycle counter (the SOC's mtime advances at the
+            // same rate); INSTRET aliases it (simplification:
+            // no kernel boot path reads instret, only perf
+            // tools do). Counters are readable in all modes
+            // (mcounteren is not implemented; writes to it are
+            // ignored, and counter reads are never blocked).
+            12'hC00: ex_csr_old = core_cycles[31:0];
+            12'hC80: ex_csr_old = core_cycles[63:32];
+            12'hC01: ex_csr_old = core_cycles[31:0];
+            12'hC81: ex_csr_old = core_cycles[63:32];
+            12'hC02: ex_csr_old = core_cycles[31:0];
+            12'hC82: ex_csr_old = core_cycles[63:32];
             default: ex_csr_old = 32'b0;
         endcase
     end
@@ -452,6 +545,16 @@ module big32_core_pipe (
         if (id_ex_fetch_fault) begin
             ex_trap_cause = 32'd12;
             ex_trap_tval = id_ex_pc;
+        end else if (ex_misaligned) begin
+            // Misaligned outranks page fault (privileged-spec
+            // trap priority: misaligned, then access fault,
+            // then page fault).
+            ex_trap_cause = ex_mis_cause;
+            ex_trap_tval = ex_va_comb;
+        end else if (tlb_data_perm_fault) begin
+            ex_trap_cause = (ex_is_store || ex_is_amo) ?
+                            32'd15 : 32'd13;
+            ex_trap_tval = ex_va_comb;
         end else if (ptw_data_fault) begin
             ex_trap_cause = ptw_data_fault_cause;
             ex_trap_tval = ptw_va;
@@ -474,7 +577,8 @@ module big32_core_pipe (
                        csr_medeleg[ex_trap_cause[4:0]];
     end
     wire ex_is_exception = ex_is_ecall || ex_is_ebreak || ex_illegal ||
-                           id_ex_fetch_fault || ptw_data_fault;
+                           id_ex_fetch_fault || ptw_data_fault ||
+                           tlb_data_perm_fault || ex_misaligned;
     // A trap goes to S whenever delegated, even if mtvec is 0.
     // A trap to M with mtvec == 0 halts (the Phase 1 rule,
     // extended to illegal/page-fault traps with no handler).
@@ -711,12 +815,105 @@ module big32_core_pipe (
     // Phase 3: after a data walk completes, the MEM address is
     // the translated physical address (which already includes
     // the page offset); otherwise it is the virtual address.
+    // Phase 5: the raw virtual effective address, before any
+    // translation. The data TLB lookup uses it (not
+    // ex_mem_addr_comb, which would be a combinational cycle).
+    wire [31:0] ex_va_comb = ex_is_load  ? (ex_rs1_fwd + id_ex_imm_i) :
+                             ex_is_store ? (ex_rs1_fwd + id_ex_imm_s) :
+                             ex_rs1_fwd;
+    // Phase 5 data TLB lookup. Permission rule mirrors the
+    // walker: load needs R, store/AMO needs W, and the U/S
+    // rules apply (S fetching from a U page faults unless
+    // SUM; U touching an S page faults). W-without-R pages
+    // never reach the TLB (the walker faults them).
+    reg tlb_data_hit, tlb_data_perm_ok;
+    reg tlb_data_rw_ok, tlb_data_priv_ok, tlb_data_dbit;
+    reg [31:0] tlb_data_pa;
+    integer td;
+    always @* begin
+        tlb_data_hit = 1'b0;
+        tlb_data_perm_ok = 1'b0;
+        tlb_data_rw_ok = 1'b0;
+        tlb_data_priv_ok = 1'b0;
+        tlb_data_dbit = 1'b0;
+        tlb_data_pa = 32'b0;
+        for (td = 0; td < 16; td = td + 1) begin
+            if (tlb_valid[td]) begin
+                if (tlb_super[td]) begin
+                    if (tlb_vpn[td][19:10] == ex_va_comb[31:22]) begin
+                        tlb_data_hit = 1'b1;
+                        tlb_data_pa = {tlb_ppn[td][19:10],
+                                       ex_va_comb[21:0]};
+                        tlb_data_rw_ok =
+                            (ex_is_store || ex_is_amo) ?
+                            tlb_w[td] : tlb_r[td];
+                        tlb_data_priv_ok =
+                            !((priv == 2'd1) && tlb_u[td] &&
+                              !csr_sstatus[18]) &&
+                            !((priv == 2'd0) && !tlb_u[td]);
+                        tlb_data_dbit = tlb_d[td];
+                    end
+                end else if (tlb_vpn[td] == ex_va_comb[31:12]) begin
+                    tlb_data_hit = 1'b1;
+                    tlb_data_pa = {tlb_ppn[td], ex_va_comb[11:0]};
+                    tlb_data_rw_ok =
+                        (ex_is_store || ex_is_amo) ?
+                        tlb_w[td] : tlb_r[td];
+                    tlb_data_priv_ok =
+                        !((priv == 2'd1) && tlb_u[td] &&
+                          !csr_sstatus[18]) &&
+                        !((priv == 2'd0) && !tlb_u[td]);
+                    tlb_data_dbit = tlb_d[td];
+                end
+            end
+        end
+        // A store/AMO needs D=1 in the cached entry; a D=0 hit
+        // is NOT a permission fault, it is a D-miss that must
+        // re-walk (state 4 sets D) instead of faulting.
+        tlb_data_perm_ok = tlb_data_rw_ok && tlb_data_priv_ok &&
+            (((ex_is_store || ex_is_amo) && !tlb_data_dbit) ?
+             1'b0 : 1'b1);
+    end
+    wire tlb_data_d_miss = fetch_trans_enabled && tlb_data_hit &&
+                           tlb_data_rw_ok && tlb_data_priv_ok &&
+                           (ex_is_store || ex_is_amo) &&
+                           !tlb_data_dbit;
+    wire tlb_data_hit_ok = fetch_trans_enabled && tlb_data_hit &&
+                           tlb_data_perm_ok &&
+                           (ex_is_load || ex_is_store || ex_is_amo);
+    wire tlb_data_perm_fault = fetch_trans_enabled && tlb_data_hit &&
+                               !tlb_data_perm_ok &&
+                               !tlb_data_d_miss &&
+                               (ex_is_load || ex_is_store || ex_is_amo);
     wire [31:0] ex_mem_addr_comb = (ptw_data_done &&
                                     (ex_is_load || ex_is_store ||
                                      ex_is_amo)) ? ptw_data_pa :
-                                   ex_is_load  ? (ex_rs1_fwd + id_ex_imm_i) :
-                                   ex_is_store ? (ex_rs1_fwd + id_ex_imm_s) :
-                                   ex_rs1_fwd;
+                                   tlb_data_hit_ok ? tlb_data_pa :
+                                   ex_va_comb;
+    // Phase 5 misaligned access: load/store halfword needs
+    // addr[0]==0, load/store/AMO word needs addr[1:0]==0.
+    // Byte accesses are never misaligned. A misaligned LR
+    // is a load misaligned (cause 4); a misaligned SC/AMO
+    // is a store misaligned (cause 6).
+    wire ex_is_lr = ex_is_amo && (ex_amo_f5 == 5'b00010);
+    wire ex_misaligned = (ex_is_load &&
+                          (((id_ex_funct3 == 3'b001) ||
+                            (id_ex_funct3 == 3'b101)) &&
+                           ex_va_comb[0])) ||
+                         (ex_is_load &&
+                          (id_ex_funct3 == 3'b010) &&
+                          (ex_va_comb[1:0] != 2'b00)) ||
+                         (ex_is_store &&
+                          (id_ex_funct3 == 3'b001) &&
+                          ex_va_comb[0]) ||
+                         (ex_is_store &&
+                          (id_ex_funct3 == 3'b010) &&
+                          (ex_va_comb[1:0] != 2'b00)) ||
+                         (ex_is_amo &&
+                          (ex_va_comb[1:0] != 2'b00));
+    wire [31:0] ex_mis_cause = (ex_is_load ||
+                                (ex_is_amo && ex_is_lr)) ?
+                               32'd4 : 32'd6;
     reg [31:0] ex_result;
     reg        ex_reg_write;
     always @* begin
@@ -775,6 +972,33 @@ module big32_core_pipe (
                          (id_ex_csr_addr == 12'h180);
     wire satp_stall = satp_pending;
 
+    // ================= Phase 5: SUM stall ============================
+    // A write to sstatus (0x100) or mstatus (0x300) pending
+    // anywhere in EX/MEM/WB stalls the ID stage for every
+    // opcode, mirroring satp_pending. Reason: a translated
+    // load/store/AMO checks sstatus.SUM combinationally on a
+    // TLB hit in EX, and CSR forwarding does NOT cover that
+    // check (unlike csrr reads). Without this stall, a load
+    // two instructions after `csrs sstatus, SUM` reads the
+    // pre-csrs SUM value and faults on a U page (the old
+    // kernel's print path hit exactly this: cause 13 on the
+    // user string, cascading to cause 15 on the handler
+    // stack). The stall must include WB: the memory op
+    // reaches EX the cycle after the write leaves MEM, while
+    // the write is still in WB, and the check would still
+    // read the stale value. Writes to sstatus/mstatus are
+    // rare (kernel only), so the cost is negligible.
+    wire sum_pending = (ex_csr_write &&
+                        ((id_ex_csr_addr == 12'h100) ||
+                         (id_ex_csr_addr == 12'h300))) ||
+                       (ex_mem_csr_write &&
+                        ((ex_mem_csr_addr == 12'h100) ||
+                         (ex_mem_csr_addr == 12'h300))) ||
+                       (mem_wb_csr_write &&
+                        ((mem_wb_csr_addr == 12'h100) ||
+                         (mem_wb_csr_addr == 12'h300)));
+    wire sum_stall = sum_pending;
+
     // ================= Phase 3: page-table walker (combinational) ===
     // A walk starts only from IDLE. The start cycle itself
     // already freezes the pipeline (ptw_start joins pipe_stall),
@@ -784,17 +1008,20 @@ module big32_core_pipe (
     // drive the data port. A data walk is for the EX load/store/
     // AMO (its address is the untranslated ex_mem_addr_comb while
     // ptw_data_done is 0); a fetch walk is for the current pc.
-    // A/D bits are ignored (never required, never updated).
-    // Misaligned accesses that cross a page boundary are NOT
-    // split: the whole access uses the first page's translation
-    // (bytes continue into the next physical page), and no fault
-    // is raised for the second page.
+    // Phase 5: A/D bits ARE updated (walker state 4 writes
+    // the PTE back with A set, and D set for stores/AMOs),
+    // and a 16-entry TLB caches translations (flushed by
+    // sfence.vma and satp writes). Misaligned accesses trap
+    // (load cause 4, store/AMO cause 6) before any walk;
+    // the Phase 1-4 wrap-into-next-page behaviour is gone.
     wire data_trans_needed = fetch_trans_enabled &&
                              (ex_is_load || ex_is_store || ex_is_amo) &&
-                             !ptw_data_done && !ptw_data_fault;
+                             !ptw_data_done && !ptw_data_fault &&
+                             !tlb_data_hit_ok && !tlb_data_perm_fault;
     wire fetch_trans_needed = fetch_trans_enabled &&
                               !(fetch_pa_valid &&
                                 (fetch_pa_pc == pc)) &&
+                              !tlb_fetch_hit &&
                               !fetch_fault_pending;
     wire ptw_start_data = (ptw_state == 3'd0) && data_trans_needed &&
                           !div_stall && !ex_trap && !ex_halt && !halted;
@@ -878,18 +1105,33 @@ module big32_core_pipe (
     wire int_tim_s_take = irq_timer && (priv != 2'd3) &&
                           csr_mideleg[7] && csr_sie[5] &&
                           ((priv == 2'd0) || csr_sstatus[1]);
+    // Phase 5 software interrupt (code 3 M / 1 S, mideleg bit 3,
+    // sie bit 1). Priority, highest first: external, software,
+    // timer (privileged-spec order MEI > MSI > MTI, and the
+    // supervisor remaps in the same order).
+    wire int_sof_s_take = irq_soft && (priv != 2'd3) &&
+                          csr_mideleg[3] && csr_sie[1] &&
+                          ((priv == 2'd0) || csr_sstatus[1]);
     wire int_ext_m_take = irq_ext && csr_mie[11] &&
                           ((priv == 2'd3) ? csr_mstatus[3] : 1'b1) &&
                           !int_ext_s_take;
+    wire int_sof_m_take = irq_soft && csr_mie[3] &&
+                          ((priv == 2'd3) ? csr_mstatus[3] : 1'b1) &&
+                          !int_sof_s_take && !int_ext_m_take;
     wire int_tim_m_take = irq_timer && csr_mie[7] &&
                           ((priv == 2'd3) ? csr_mstatus[3] : 1'b1) &&
-                          !int_tim_s_take;
+                          !int_tim_s_take && !int_sof_m_take &&
+                          !int_ext_m_take;
     wire int_take_ext = int_ext_s_take || int_ext_m_take;
+    wire int_take_sof = int_sof_s_take || int_sof_m_take;
     wire int_take_tim = int_tim_s_take || int_tim_m_take;
-    wire int_to_s = int_take_ext ? int_ext_s_take : int_tim_s_take;
+    wire int_to_s = int_take_ext ? int_ext_s_take :
+                    int_take_sof ? int_sof_s_take : int_tim_s_take;
     wire [31:0] int_code = int_to_s ?
-                           (int_take_ext ? 32'd9 : 32'd5) :
-                           (int_take_ext ? 32'd11 : 32'd7);
+                           (int_take_ext ? 32'd9 :
+                            int_take_sof ? 32'd1 : 32'd5) :
+                           (int_take_ext ? 32'd11 :
+                            int_take_sof ? 32'd3 : 32'd7);
     wire [31:0] mtvec_base = {csr_mtvec[31:2], 2'b00};
     wire [31:0] int_vec_base = int_to_s ? {csr_stvec[31:2], 2'b00}
                                         : mtvec_base;
@@ -900,7 +1142,8 @@ module big32_core_pipe (
                              int_vec_base;
     wire [31:0] int_mepc = ex_redirect ? ex_target :
                           (if_id_valid ? if_id_pc : pc);
-    wire int_take = !halted && (int_take_ext || int_take_tim) &&
+    wire int_take = !halted &&
+                    (int_take_ext || int_take_sof || int_take_tim) &&
                     !ex_trap && !ex_halt && !div_stall &&
                     !ptw_active && !ptw_start;
 
@@ -912,7 +1155,8 @@ module big32_core_pipe (
     // a page-table walk (or its start cycle) freezes the whole
     // front of the pipeline like the divider does.
     wire pipe_stall = div_stall || load_stall || csr_stall ||
-                      satp_stall || ptw_active || ptw_start;
+                      satp_stall || sum_stall || ptw_active ||
+                      ptw_start;
 
     // ================= Sequential: PC ================================
     always @(posedge clk or negedge rst_n) begin
@@ -969,6 +1213,15 @@ module big32_core_pipe (
                 if_id_pc <= pc;
                 if_id_valid <= 1'b1;
                 if_id_fetch_fault <= 1'b1;
+            end else if (tlb_fetch_perm_fault) begin
+                // Phase 5: the TLB hit but the page is not
+                // executable (or not accessible at this
+                // privilege); same marker mechanism as a walk
+                // fault, no walk needed.
+                if_id_instr <= 32'b0;
+                if_id_pc <= pc;
+                if_id_valid <= 1'b1;
+                if_id_fetch_fault <= 1'b1;
             end else begin
                 if_id_instr <= instr_i;
                 if_id_pc <= pc;
@@ -1016,7 +1269,8 @@ module big32_core_pipe (
                 id_ex_amo_f5 <= 5'b0;
             end else if (div_stall || ptw_active || ptw_start) begin
                 // hold: divider / page-walk instruction stays in EX
-            end else if (load_stall || csr_stall || satp_stall) begin
+            end else if (load_stall || csr_stall || satp_stall ||
+                       sum_stall) begin
                 id_ex_fetch_fault <= 1'b0;
                 id_ex_pc <= 32'b0;
                 id_ex_opcode <= 7'b0;
@@ -1086,7 +1340,12 @@ module big32_core_pipe (
             // (this is what stops an illegal CSR instruction from
             // writing rd or the CSR in WB), and a page-walk cycle
             // (or its start cycle) bubbles EX/MEM so MEM drains.
-            if (div_stall || ex_trap || ptw_active || ptw_start) begin
+            // Phase 5: a HALTING instruction also bubbles EX/MEM:
+            // without this, a misaligned load (or an illegal CSR
+            // instruction) with mtvec==0 would still commit its
+            // wrapped load / CSR write in WB after halting.
+            if (div_stall || ex_trap || ex_halt || ptw_active ||
+                ptw_start) begin
                 ex_mem_pc <= 32'b0;
                 ex_mem_rd <= 5'b0;
                 ex_mem_funct3 <= 3'b0;
@@ -1183,6 +1442,12 @@ module big32_core_pipe (
             // cached fetch translation (same pc, new tables).
             if (mem_wb_csr_write && (mem_wb_csr_addr == 12'h180))
                 fetch_pa_valid <= 1'b0;
+            // Phase 5: an sfence.vma executing in M/S (not a
+            // U-mode illegal sfence) invalidates the cached
+            // fetch translation too; the TLB block flushes
+            // all entries on the same condition.
+            if (ex_is_sfence && (priv != 2'd0))
+                fetch_pa_valid <= 1'b0;
             // The data translation is consumed when the EX
             // instruction advances to MEM (which happens exactly
             // when nothing stalls/bubbles EX/MEM).
@@ -1245,6 +1510,27 @@ module big32_core_pipe (
                                                         32'd15 : 32'd13;
                             end
                             ptw_state <= 3'd0;
+                        end else if (!ptw_pte_now[6] ||
+                                     (ptw_is_store &&
+                                      !ptw_pte_now[7])) begin
+                            // Phase 5: leaf accepted, but the A
+                            // bit (or D for a store/AMO) is
+                            // clear: write the PTE back with
+                            // the bit(s) set before completing.
+                            ptw_accept_pte <= ptw_pte_now;
+                            ptw_accept_pa <= {ptw_pte_now[29:20],
+                                              ptw_va[21:0]};
+                            ptw_accept_va <= ptw_va;
+                            ptw_accept_super <= 1'b1;
+                            ptw_accept_is_fetch <= ptw_is_fetch;
+                            ptw_accept_is_store <= ptw_is_store;
+                            ptw_write_addr <= ptw_addr;
+                            ptw_write_data <= ptw_pte_now |
+                                              32'h00000040 |
+                                              (ptw_is_store ?
+                                               32'h00000080 :
+                                               32'h00000000);
+                            ptw_state <= 3'd4;
                         end else begin
                             if (ptw_is_fetch) begin
                                 fetch_pa <= {ptw_pte_now[29:20],
@@ -1284,6 +1570,26 @@ module big32_core_pipe (
                                                     32'd15 : 32'd13;
                         end
                         ptw_state <= 3'd0;
+                    end else if (!ptw_pte_now[6] ||
+                                 (ptw_is_store &&
+                                  !ptw_pte_now[7])) begin
+                        // Phase 5: A/D writeback, as for a
+                        // superpage leaf above.
+                        ptw_accept_pte <= ptw_pte_now;
+                        ptw_accept_pa <= {ptw_pte_now[29:20],
+                                          ptw_pte_now[19:10],
+                                          ptw_va[11:0]};
+                        ptw_accept_va <= ptw_va;
+                        ptw_accept_super <= 1'b0;
+                        ptw_accept_is_fetch <= ptw_is_fetch;
+                        ptw_accept_is_store <= ptw_is_store;
+                        ptw_write_addr <= ptw_addr;
+                        ptw_write_data <= ptw_pte_now |
+                                          32'h00000040 |
+                                          (ptw_is_store ?
+                                           32'h00000080 :
+                                           32'h00000000);
+                        ptw_state <= 3'd4;
                     end else begin
                         if (ptw_is_fetch) begin
                             fetch_pa <= {ptw_pte_now[29:20],
@@ -1300,10 +1606,117 @@ module big32_core_pipe (
                         ptw_state <= 3'd0;
                     end
                 end
+                3'd4: begin
+                    // Phase 5: the A/D writeback cycle just
+                    // wrote the PTE (d_we_o was forced high
+                    // during this state); now complete the
+                    // translation. The TLB block inserts the
+                    // accepted PTE on this same edge.
+                    if (ptw_accept_is_fetch) begin
+                        fetch_pa <= ptw_accept_pa;
+                        fetch_pa_pc <= ptw_accept_va;
+                        fetch_pa_valid <= 1'b1;
+                    end else begin
+                        ptw_data_pa <= ptw_accept_pa;
+                        ptw_data_done <= 1'b1;
+                    end
+                    ptw_state <= 3'd0;
+                end
                 default: begin
                     ptw_state <= 3'd0;
                 end
             endcase
+        end
+    end
+
+    // ================= Sequential: TLB (Phase 5) ======================
+    // Sole driver of the TLB registers. Insert on a walk
+    // acceptance: immediately for a leaf whose A (and D, for a
+    // store) is already set, or on state-4 completion after
+    // the A/D writeback. Flush (all entries) on any sfence.vma
+    // in M/S and on any satp write in WB. The flush condition
+    // takes priority over insert on the same edge: an sfence
+    // can never coincide with a walk acceptance for the same
+    // instruction (walks freeze EX), so this is belt-and-braces.
+    integer tlbi;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            tlb_rr <= 4'b0;
+            for (tlbi = 0; tlbi < 16; tlbi = tlbi + 1) begin
+                tlb_valid[tlbi] <= 1'b0;
+                tlb_vpn[tlbi] <= 20'b0;
+                tlb_ppn[tlbi] <= 20'b0;
+                tlb_r[tlbi] <= 1'b0;
+                tlb_w[tlbi] <= 1'b0;
+                tlb_x[tlbi] <= 1'b0;
+                tlb_u[tlbi] <= 1'b0;
+                tlb_d[tlbi] <= 1'b0;
+                tlb_super[tlbi] <= 1'b0;
+            end
+        end else if ((ex_is_sfence && (priv != 2'd0)) ||
+                     (mem_wb_csr_write &&
+                      (mem_wb_csr_addr == 12'h180))) begin
+            for (tlbi = 0; tlbi < 16; tlbi = tlbi + 1)
+                tlb_valid[tlbi] <= 1'b0;
+        end else if (ptw_state == 3'd4) begin
+            // Invalidate any older entry overlapping the new
+            // entry's range (a stale D=0 entry must not shadow
+            // the fresh D=1 entry after a D-miss re-walk).
+            for (tlbi = 0; tlbi < 16; tlbi = tlbi + 1)
+                if (tlb_valid[tlbi] &&
+                    ((tlb_super[tlbi] &&
+                      (tlb_vpn[tlbi][19:10] ==
+                       ptw_accept_va[31:22])) ||
+                     (!tlb_super[tlbi] &&
+                      (ptw_accept_super ?
+                       (tlb_vpn[tlbi][19:10] ==
+                        ptw_accept_va[31:22]) :
+                       (tlb_vpn[tlbi] ==
+                        ptw_accept_va[31:12])))))
+                    tlb_valid[tlbi] <= 1'b0;
+            tlb_valid[tlb_rr] <= 1'b1;
+            tlb_vpn[tlb_rr] <= ptw_accept_va[31:12];
+            tlb_ppn[tlb_rr] <= ptw_accept_pte[29:10];
+            tlb_r[tlb_rr] <= ptw_accept_pte[1];
+            tlb_w[tlb_rr] <= ptw_accept_pte[2];
+            tlb_x[tlb_rr] <= ptw_accept_pte[3];
+            tlb_u[tlb_rr] <= ptw_accept_pte[4];
+            // After the state-4 writeback, memory has D=1 for
+            // a store/AMO walk, else the original PTE's D.
+            tlb_d[tlb_rr] <= ptw_accept_is_store ? 1'b1 :
+                             ptw_accept_pte[7];
+            tlb_super[tlb_rr] <= ptw_accept_super;
+            tlb_rr <= tlb_rr + 4'd1;
+        end else if (((ptw_state == 3'd2) || (ptw_state == 3'd3)) &&
+                     ptw_leaf_now && !ptw_perm_fault_now &&
+                     !((ptw_state == 3'd2) &&
+                       (ptw_pte_now[19:10] != 10'b0)) &&
+                     ptw_pte_now[6] &&
+                     (!ptw_is_store || ptw_pte_now[7])) begin
+            // Invalidate older overlapping entries (see the
+            // state-4 insert above for why this matters).
+            for (tlbi = 0; tlbi < 16; tlbi = tlbi + 1)
+                if (tlb_valid[tlbi] &&
+                    ((tlb_super[tlbi] &&
+                      (tlb_vpn[tlbi][19:10] ==
+                       ptw_va[31:22])) ||
+                     (!tlb_super[tlbi] &&
+                      ((ptw_state == 3'd2) ?
+                       (tlb_vpn[tlbi][19:10] ==
+                        ptw_va[31:22]) :
+                       (tlb_vpn[tlbi] ==
+                        ptw_va[31:12])))))
+                    tlb_valid[tlbi] <= 1'b0;
+            tlb_valid[tlb_rr] <= 1'b1;
+            tlb_vpn[tlb_rr] <= ptw_va[31:12];
+            tlb_ppn[tlb_rr] <= ptw_pte_now[29:10];
+            tlb_r[tlb_rr] <= ptw_pte_now[1];
+            tlb_w[tlb_rr] <= ptw_pte_now[2];
+            tlb_x[tlb_rr] <= ptw_pte_now[3];
+            tlb_u[tlb_rr] <= ptw_pte_now[4];
+            tlb_d[tlb_rr] <= ptw_pte_now[7];
+            tlb_super[tlb_rr] <= (ptw_state == 3'd2);
+            tlb_rr <= tlb_rr + 4'd1;
         end
     end
 
