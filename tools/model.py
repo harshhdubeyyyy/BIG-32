@@ -6,9 +6,10 @@ Semantics mirror src/big32.v exactly: single-cycle, 32 registers (x0 = 0),
 16KB instruction memory (PC byte address, index PC[13:2]), 64KB data
 memory (addresses modulo 64KB), RV32IMAC (word atomics only), M-mode
 CSRs, ECALL/EBREAK trap to mtvec when mtvec is non-zero and halt
-otherwise, UART MMIO at 0x10000000 (TX), 0x10000004 (RX, returns -1),
-0x10000008 (status, returns 0). Unknown opcodes are NOP, matching
-the Verilog default.
+otherwise, UART MMIO at 0x10000000 (TX), 0x10000004 (RX: pops
+the next byte from run()'s input_bytes queue, or -1 when the
+queue is empty), 0x10000008 (status, returns 0). Unknown
+opcodes are NOP, matching the Verilog default.
 
 Phase E addition (timer interrupts, model-only — the Verilog has no
 CLINT yet): mtime at 0x10000010 and mtimecmp at 0x10000018 (32-bit
@@ -37,11 +38,12 @@ def sext(x, bits):
     return x
 
 
-def run(hexfile, trace=False):
+def run(hexfile, trace=False, input_bytes=b""):
     imem = [int(l.strip(), 16) for l in open(hexfile) if l.strip()]
     imem += [0] * (4096 - len(imem))
     dmem = bytearray(65536)
     regs = [0] * 32
+    rx_queue = bytearray(input_bytes)
     # Sparse CSR file, matching the Verilog v4, plus Phase E timer CSRs.
     # Reads of unimplemented CSRs return 0, writes are ignored.
     # mhartid (0xF14) is read-only 0 and is not stored. mip (0x344) is
@@ -203,7 +205,7 @@ def run(hexfile, trace=False):
             if full_a == 0x10000000:
                 wb = 0
             elif full_a == 0x10000004:
-                wb = MASK32
+                wb = rx_queue.pop(0) if rx_queue else MASK32
             elif full_a == 0x10000008:
                 wb = 0
             elif full_a == 0x10000010:
