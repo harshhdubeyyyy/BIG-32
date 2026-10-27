@@ -9,6 +9,17 @@ CSRs, ECALL/EBREAK trap to mtvec when mtvec is non-zero and halt
 otherwise, UART MMIO at 0x10000000 (TX), 0x10000004 (RX, returns -1),
 0x10000008 (status, returns 0). Unknown opcodes are NOP, matching
 the Verilog default.
+
+Phase E addition (timer interrupts, model-only — the Verilog has no
+CLINT yet): mtime at 0x10000010 and mtimecmp at 0x10000018 (32-bit
+low halves, read/write; mtime advances once per executed step).
+mip.MTIP (bit 7) is level-sensitive: 1 while mtime >= mtimecmp.
+When mtvec is non-zero, mstatus.MIE is set, mie.MTIE is set, and
+MTIP is pending, the model traps to mtvec with mcause 0x80000007
+before fetching the next instruction. Trap entry saves MIE into
+MPIE and clears MIE (ECALL/EBREAK too, matching real hardware);
+mret restores MIE from MPIE and sets MPIE. The kernel clears the
+pending level by programming mtimecmp past mtime before mret.
 """
 import sys
 
@@ -31,16 +42,30 @@ def run(hexfile, trace=False):
     imem += [0] * (4096 - len(imem))
     dmem = bytearray(65536)
     regs = [0] * 32
-    # Sparse CSR file, matching the Verilog v4: only these CSRs exist.
+    # Sparse CSR file, matching the Verilog v4, plus Phase E timer CSRs.
     # Reads of unimplemented CSRs return 0, writes are ignored.
-    # mhartid (0xF14) is read-only 0 and is not stored.
-    csrs = {0x300: 0, 0x305: 0, 0x340: 0, 0x341: 0, 0x342: 0, 0x343: 0}
+    # mhartid (0xF14) is read-only 0 and is not stored. mip (0x344) is
+    # NOT stored: MTIP is computed from mtime/mtimecmp on every read,
+    # and writes to it are ignored (MTIP is read-only in hardware).
+    csrs = {0x300: 0, 0x304: 0, 0x305: 0, 0x340: 0, 0x341: 0, 0x342: 0,
+            0x343: 0}
+    mtime = 0
+    mtimecmp = MASK32
     reservation_valid = False
     reservation_addr = 0
     uart = bytearray()
     pc = 0
     halted = False
     steps = 0
+
+    def trap_entry(mcause):
+        # MPIE <- MIE, MIE <- 0; mepc/mcause set; jump to mtvec.
+        old_ms = csrs[0x300]
+        csrs[0x300] = ((old_ms & ~0x88) | ((old_ms & 0x8) << 4)) & MASK32
+        csrs[0x341] = pc
+        csrs[0x342] = mcause
+        csrs[0x343] = 0
+        return csrs[0x305] & ~3
 
     def load_word(a):
         a &= 0xFFFF
@@ -53,6 +78,11 @@ def run(hexfile, trace=False):
             dmem[(a + k) & 0xFFFF] = (val >> (8 * k)) & 0xFF
 
     while not halted and steps < 1000000:
+        # Timer interrupt delivery, before fetch: level-sensitive MTIP,
+        # gated on mtvec set, mstatus.MIE (bit 3) and mie.MTIE (bit 7).
+        if (csrs[0x305] != 0 and (csrs[0x300] & 0x8) and
+                (csrs[0x304] & 0x80) and mtime >= mtimecmp):
+            pc = trap_entry(0x80000007)
         instr = imem[(pc >> 2) & 0xFFF]
         opcode = instr & 0x7F
         rd = (instr >> 7) & 0x1F
@@ -168,7 +198,7 @@ def run(hexfile, trace=False):
                 wb = old
                 if v1 == reservation_addr:
                     reservation_valid = False
-        elif opcode == 0x03:  # Loads (with UART MMIO)
+        elif opcode == 0x03:  # Loads (with UART + timer MMIO)
             full_a = (v1 + imm_i) & MASK32
             if full_a == 0x10000000:
                 wb = 0
@@ -176,6 +206,10 @@ def run(hexfile, trace=False):
                 wb = MASK32
             elif full_a == 0x10000008:
                 wb = 0
+            elif full_a == 0x10000010:
+                wb = mtime
+            elif full_a == 0x10000018:
+                wb = mtimecmp
             else:
                 a = full_a & 0xFFFF
                 if funct3 == 0x0:
@@ -190,12 +224,16 @@ def run(hexfile, trace=False):
                 elif funct3 == 0x5:
                     wb = dmem[a] | (dmem[(a + 1) & 0xFFFF] << 8)
                 wb &= MASK32
-        elif opcode == 0x23:  # Stores (with UART MMIO)
+        elif opcode == 0x23:  # Stores (with UART + timer MMIO)
             full_a = (v1 + imm_s) & MASK32
             if full_a == 0x10000000:
                 uart.append(v2 & 0xFF)
             elif full_a in (0x10000004, 0x10000008):
                 pass
+            elif full_a == 0x10000010:
+                mtime = v2 & MASK32
+            elif full_a == 0x10000018:
+                mtimecmp = v2 & MASK32
             else:
                 a = full_a & 0xFFFF
                 if funct3 == 0x0:
@@ -226,9 +264,12 @@ def run(hexfile, trace=False):
         elif opcode == 0x73:  # SYSTEM: CSR, mret, ECALL, EBREAK
             csr_addr = (instr >> 20) & 0xFFF
             if funct3 != 0:  # CSR instruction
-                old = csrs.get(csr_addr, 0)
+                if csr_addr == 0x344:  # mip: computed MTIP, read-only
+                    old = 0x80 if mtime >= mtimecmp else 0
+                else:
+                    old = csrs.get(csr_addr, 0)
                 wb = old
-                if csr_addr in csrs:  # unimplemented + mhartid: ignore writes
+                if csr_addr in csrs:  # unimplemented + mhartid + mip: ignore writes
                     uimm = rs1
                     if funct3 == 0x1:
                         csrs[csr_addr] = v1
@@ -246,22 +287,19 @@ def run(hexfile, trace=False):
                     elif funct3 == 0x7:
                         if uimm != 0:
                             csrs[csr_addr] = old & ~uimm & MASK32
-            elif csr_addr == 0x302:  # mret
+            elif csr_addr == 0x302:  # mret: MIE <- MPIE, MPIE <- 1
                 npc = csrs.get(0x341, 0)
+                old_ms = csrs.get(0x300, 0)
+                csrs[0x300] = ((old_ms & ~0x88) |
+                               ((old_ms & 0x80) >> 4) | 0x80) & MASK32
             elif csr_addr == 0x000:  # ECALL
                 if csrs.get(0x305, 0) != 0:
-                    csrs[0x341] = pc
-                    csrs[0x342] = 11
-                    csrs[0x343] = 0
-                    npc = csrs[0x305] & ~3
+                    npc = trap_entry(11)
                 else:
                     halted = True
             elif csr_addr == 0x001:  # EBREAK
                 if csrs.get(0x305, 0) != 0:
-                    csrs[0x341] = pc
-                    csrs[0x342] = 3
-                    csrs[0x343] = 0
-                    npc = csrs[0x305] & ~3
+                    npc = trap_entry(3)
                 else:
                     halted = True
         # else: unknown opcode -> NOP, matching the Verilog default
@@ -273,9 +311,10 @@ def run(hexfile, trace=False):
         if not halted:
             pc = npc
         steps += 1
+        mtime = (mtime + 1) & MASK32
     return {"a0": regs[10], "sp": regs[2], "regs": regs, "dmem": dmem,
             "halted": halted, "steps": steps, "pc": pc,
-            "uart": bytes(uart), "csrs": csrs}
+            "uart": bytes(uart), "csrs": csrs, "mtime": mtime}
 
 
 if __name__ == "__main__":
